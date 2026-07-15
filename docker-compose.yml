@@ -1,0 +1,109 @@
+version: "3.9"
+
+services:
+
+  # --- Storage: raw zone (S3-compatible object storage) ---
+  minio:
+    image: minio/minio:latest
+    container_name: accidents-minio
+    ports:
+      - "9000:9000"   # API
+      - "9001:9001"   # Console
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - accidents-net
+
+  # One-off helper that creates the raw/processed buckets on startup
+  minio-init:
+    image: minio/mc:latest
+    container_name: accidents-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin} &&
+      mc mb -p local/accidents-raw &&
+      mc mb -p local/accidents-processed &&
+      exit 0
+      "
+    networks:
+      - accidents-net
+
+  # --- Storage: feature store / warehouse ---
+  postgres:
+    image: postgres:15
+    container_name: accidents-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-accidents_app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: ${POSTGRES_DB:-accidents}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-accidents_app}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - accidents-net
+
+  # --- Ingestion microservice: pulls the monthly partition into the raw zone ---
+  ingestion:
+    build: ./ingestion
+    container_name: accidents-ingestion
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      RAW_BUCKET: accidents-raw
+      SOURCE_CSV_PATH: /data/us_accidents.csv
+    volumes:
+      - ./data:/data:ro
+    networks:
+      - accidents-net
+    # Runs once and exits — in production this is triggered monthly by Airflow (see README)
+
+  # --- Batch processing microservice: Spark cleaning + feature engineering + aggregation ---
+  spark-job:
+    build: ./spark
+    container_name: accidents-spark-job
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      RAW_BUCKET: accidents-raw
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: ${POSTGRES_DB:-accidents}
+      POSTGRES_USER: ${POSTGRES_USER:-accidents_app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    networks:
+      - accidents-net
+    # Runs once and exits — in production this is triggered quarterly by Airflow (see README)
+
+volumes:
+  minio_data:
+  postgres_data:
+
+networks:
+  accidents-net:
+    driver: bridge
